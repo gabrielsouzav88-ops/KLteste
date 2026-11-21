@@ -1,5 +1,6 @@
--- Auto Farm v2 (Fluent UI)
--- Novidades: volta pro farm ao morrer, detecta level e troca de quest sozinho.
+-- Auto Farm v3 (Fluent UI)
+-- Novidades: aba de Status (upar stats), quest do Smoky, detecção do level
+-- necessário de cada quest e aviso quando não for possível descobrir.
 -- Biblioteca: https://github.com/dawid-scripts/Fluent
 
 local Players = game:GetService("Players")
@@ -17,17 +18,18 @@ local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/
 ----------------------------------------------------------------
 local M1Args = {"FS_None_M1"}
 
--- Lista de quests em ordem de level. O script usa a ÚLTIMA cuja
--- MinLevel seja menor ou igual ao seu level.
--- Npc = trecho do nome do monstro (ignora espaços e maiúsculas).
--- >>> AJUSTE o MinLevel do Clown Pirates para o level real da quest <<<
+-- Npc      = trecho do nome do monstro (ignora espaços e maiúsculas)
+-- MinLevel = level necessário. Se deixar vazio (nil), o script tenta
+--            descobrir pelo "[Lv. N]" no nome do monstro dentro do jogo.
+--            Se não conseguir, ele AVISA e não troca para essa quest.
 local QUESTS = {
-	{ Name = "Kill 4 Soldiers",       MinLevel = 1,  Npc = "Soldier",       Args = {"take", "Kill 4 Soldiers"} },
-	{ Name = "Kill 5 Clown Pirates",  MinLevel = 10, Npc = "Clown Pirate",  Args = {"take", "Kill 5 Clown Pirates"} },
+	{ Name = "Kill 4 Soldiers",      MinLevel = 1,   Npc = "Soldier",      Args = {"take", "Kill 4 Soldiers"} },
+	{ Name = "Kill 5 Clown Pirates", MinLevel = nil, Npc = "Clown Pirate", Args = {"take", "Kill 5 Clown Pirates"} },
+	{ Name = "Kill 1 Smoky",         MinLevel = nil, Npc = "Smoky",        Args = {"take", "Kill 1 Smoky"} },
 }
 
--- Se o script não achar seu level sozinho, coloque aqui o caminho, ex:
--- LEVEL_PATH = function() return player.Data.Level end
+local STAT_NAMES = {"Melee", "Defense", "Sword", "Fruit"}
+
 local LEVEL_PATH = function()
 	-- Players.<seu nome>.PlayerStats.lvl
 	local stats = player:FindFirstChild("PlayerStats")
@@ -57,6 +59,12 @@ local State = {
 	Distance = 3,
 	Kills = 0,
 	Deaths = 0,
+
+	AutoStats = false,
+	StatAmount = 10,
+	StatInterval = 5,
+	Stats = {},
+	LastInfo = nil,
 }
 
 local currentQuest = nil
@@ -92,8 +100,12 @@ local function isAlive(mob)
 	return hum and hum.Health > 0 and getMobRoot(mob)
 end
 
+local function getMobFolder()
+	return workspace:FindFirstChild("Monster") or workspace
+end
+
 ----------------------------------------------------------------
--- Level
+-- Level do jogador
 ----------------------------------------------------------------
 local LEVEL_NAMES = { level = true, lv = true, lvl = true, levels = true }
 local cachedLevelObj
@@ -128,6 +140,57 @@ local function getLevel()
 end
 
 ----------------------------------------------------------------
+-- Monstros / level necessário das quests
+----------------------------------------------------------------
+local function isTarget(obj, npcPart)
+	if not obj:IsA("Model") or Players:GetPlayerFromCharacter(obj) then
+		return false
+	end
+	local wanted = normalize(npcPart)
+	local hum = obj:FindFirstChildOfClass("Humanoid")
+	if not hum then
+		return false
+	end
+	return normalize(obj.Name):find(wanted, 1, true) ~= nil
+		or normalize(hum.DisplayName):find(wanted, 1, true) ~= nil
+end
+
+local estimatedLevels = {}
+local lastScan = {}
+
+-- Descobre o level pelo "[Lv. N]" do monstro. Retorna nil se não achar.
+local function estimateLevel(q)
+	if estimatedLevels[q.Name] then
+		return estimatedLevels[q.Name]
+	end
+	if os.clock() - (lastScan[q.Name] or -math.huge) < 5 then
+		return nil
+	end
+	lastScan[q.Name] = os.clock()
+
+	local lowest
+	for _, obj in ipairs(getMobFolder():GetDescendants()) do
+		if isTarget(obj, q.Npc) then
+			local hum = obj:FindFirstChildOfClass("Humanoid")
+			local text = obj.Name .. " " .. (hum and hum.DisplayName or "")
+			local n = tonumber(text:match("[Ll][Vv]%.?%s*(%d+)"))
+			if n and (not lowest or n < lowest) then
+				lowest = n
+			end
+		end
+	end
+
+	if lowest then
+		estimatedLevels[q.Name] = lowest
+	end
+	return lowest
+end
+
+local function requiredLevel(q)
+	return q.MinLevel or estimateLevel(q)
+end
+
+----------------------------------------------------------------
 -- Quest / ataque
 ----------------------------------------------------------------
 local function findQuestByName(name)
@@ -139,20 +202,32 @@ local function findQuestByName(name)
 	return QUESTS[1]
 end
 
+-- Retorna: quest escolhida, próxima quest bloqueada, lista de quests sem level conhecido
 local function pickQuest()
 	if State.AutoByLevel then
 		local level = getLevel()
 		if level then
-			local chosen = QUESTS[1]
+			local chosen, chosenReq = nil, -1
+			local nextLocked
+			local unknown = {}
+
 			for _, q in ipairs(QUESTS) do
-				if level >= q.MinLevel then
-					chosen = q
+				local req = requiredLevel(q)
+				if not req then
+					table.insert(unknown, q)
+				elseif level >= req then
+					if req > chosenReq then
+						chosen, chosenReq = q, req
+					end
+				elseif not nextLocked or req < nextLocked.req then
+					nextLocked = { quest = q, req = req }
 				end
 			end
-			return chosen
+
+			return chosen or QUESTS[1], nextLocked, unknown, level
 		end
 	end
-	return findQuestByName(State.ManualQuest)
+	return findQuestByName(State.ManualQuest), nil, {}, nil
 end
 
 local function takeQuest(q)
@@ -167,30 +242,14 @@ local function m1()
 	end)
 end
 
-local function isTarget(obj, npcPart)
-	if not obj:IsA("Model") or Players:GetPlayerFromCharacter(obj) then
-		return false
-	end
-	local wanted = normalize(npcPart)
-	local hum = obj:FindFirstChildOfClass("Humanoid")
-	if not hum then
-		return false
-	end
-	return normalize(obj.Name):find(wanted, 1, true) ~= nil
-		or normalize(hum.DisplayName):find(wanted, 1, true) ~= nil
-end
-
 local function findNearestMob(q)
 	local root = getRoot()
 	if not root then
 		return nil
 	end
 
-	local monster = workspace:FindFirstChild("Monster")
-	local folder = (monster and monster:FindFirstChild("Mon")) or workspace
 	local best, bestDist
-
-	for _, obj in ipairs(folder:GetDescendants()) do
+	for _, obj in ipairs(getMobFolder():GetDescendants()) do
 		if isTarget(obj, q.Npc) and isAlive(obj) then
 			local dist = (getMobRoot(obj).Position - root.Position).Magnitude
 			if not bestDist or dist < bestDist then
@@ -226,13 +285,88 @@ local function killMob(mob)
 end
 
 ----------------------------------------------------------------
+-- Upar status
+----------------------------------------------------------------
+local function getStatsRemote()
+	local ok, remote = pcall(function()
+		return player.PlayerGui.MainGui.StarterFrame.StatsFrame.RemoteEvent
+	end)
+	return ok and remote or nil
+end
+
+local function upgradeStat(stat, amount)
+	local remote = getStatsRemote()
+	if not remote then
+		return false
+	end
+	pcall(function()
+		remote:FireServer(stat, amount)
+	end)
+	return true
+end
+
+local function upgradeSelected()
+	local any = false
+	for _, stat in ipairs(STAT_NAMES) do
+		if State.Stats[stat] then
+			any = true
+			if not upgradeStat(stat, State.StatAmount) then
+				return false, "Remote dos status não encontrado."
+			end
+		end
+	end
+	if not any then
+		return false, "Selecione ao menos um status."
+	end
+	return true
+end
+
+----------------------------------------------------------------
+-- Diagnóstico: lista monstros e possíveis dados de quest no console
+----------------------------------------------------------------
+local function debugScan()
+	local lines = 0
+	local function out(...)
+		if lines < 250 then
+			print(...)
+		end
+		lines += 1
+	end
+
+	out("---- MONSTROS (nomes únicos) ----")
+	local seen = {}
+	for _, obj in ipairs(getMobFolder():GetDescendants()) do
+		if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid")
+			and not Players:GetPlayerFromCharacter(obj) and not seen[obj.Name] then
+			seen[obj.Name] = true
+			out(obj:GetFullName())
+		end
+	end
+
+	out("---- POSSÍVEIS DADOS DE QUEST ----")
+	for _, root in ipairs({ ReplicatedStorage, workspace }) do
+		for _, obj in ipairs(root:GetDescendants()) do
+			if obj.Name:lower():find("quest") then
+				out(obj.ClassName, obj:GetFullName())
+			end
+		end
+	end
+
+	Fluent:Notify({
+		Title = "Scan",
+		Content = "Resultado impresso no console do executor.",
+		Duration = 5,
+	})
+end
+
+----------------------------------------------------------------
 -- Interface
 ----------------------------------------------------------------
 local Window = Fluent:CreateWindow({
 	Title = "Auto Farm",
-	SubTitle = "v2",
+	SubTitle = "v3",
 	TabWidth = 140,
-	Size = UDim2.fromOffset(520, 440),
+	Size = UDim2.fromOffset(540, 460),
 	Acrylic = false,
 	Theme = "Dark",
 	MinimizeKey = Enum.KeyCode.RightShift,
@@ -240,9 +374,11 @@ local Window = Fluent:CreateWindow({
 
 local Tabs = {
 	Farm = Window:AddTab({ Title = "Farm", Icon = "swords" }),
+	Stats = Window:AddTab({ Title = "Status", Icon = "bar-chart" }),
 	Settings = Window:AddTab({ Title = "Configurações", Icon = "settings" }),
 }
 
+-- ===== Aba Farm =====
 local StatusLabel = Tabs.Farm:AddParagraph({
 	Title = "Status",
 	Content = "Parado",
@@ -260,13 +396,11 @@ local function updateStatus(text)
 	))
 end
 
-local FarmToggle = Tabs.Farm:AddToggle("FarmToggle", {
+Tabs.Farm:AddToggle("FarmToggle", {
 	Title = "Auto Farm",
 	Description = "Pega a quest, ataca e volta sozinho se morrer",
 	Default = false,
-})
-
-FarmToggle:OnChanged(function(value)
+}):OnChanged(function(value)
 	State.Farming = value
 	currentQuest = nil -- força pegar a quest ao ligar
 	if not value then
@@ -276,7 +410,7 @@ end)
 
 Tabs.Farm:AddToggle("AutoByLevel", {
 	Title = "Trocar de quest pelo level",
-	Description = "Escolhe a quest certa de acordo com seu level",
+	Description = "Vai para a quest mais forte que seu level permite",
 	Default = true,
 }):OnChanged(function(value)
 	State.AutoByLevel = value
@@ -304,6 +438,64 @@ Tabs.Farm:AddToggle("QuestToggle", {
 	State.AutoQuest = value
 end)
 
+-- ===== Aba Status (upar stats) =====
+Tabs.Stats:AddParagraph({
+	Title = "Distribuir pontos",
+	Content = "Marque os status que quer upar. Se tiver poucos pontos, marque só um.",
+})
+
+for _, stat in ipairs(STAT_NAMES) do
+	Tabs.Stats:AddToggle("Stat_" .. stat, {
+		Title = stat,
+		Default = false,
+	}):OnChanged(function(value)
+		State.Stats[stat] = value
+	end)
+end
+
+Tabs.Stats:AddSlider("StatAmount", {
+	Title = "Pontos por vez",
+	Default = 10,
+	Min = 1,
+	Max = 100,
+	Rounding = 0,
+	Callback = function(value)
+		State.StatAmount = value
+	end,
+})
+
+Tabs.Stats:AddButton({
+	Title = "Upar agora",
+	Callback = function()
+		local ok, err = upgradeSelected()
+		Fluent:Notify({
+			Title = "Status",
+			Content = ok and "Pontos enviados." or err,
+			Duration = 3,
+		})
+	end,
+})
+
+Tabs.Stats:AddToggle("AutoStats", {
+	Title = "Upar automaticamente",
+	Description = "Repete o upar no intervalo abaixo",
+	Default = false,
+}):OnChanged(function(value)
+	State.AutoStats = value
+end)
+
+Tabs.Stats:AddSlider("StatInterval", {
+	Title = "Intervalo do auto (s)",
+	Default = 5,
+	Min = 1,
+	Max = 60,
+	Rounding = 0,
+	Callback = function(value)
+		State.StatInterval = value
+	end,
+})
+
+-- ===== Aba Configurações =====
 Tabs.Settings:AddSlider("AttackDelay", {
 	Title = "Delay entre M1 (s)",
 	Default = 0.15,
@@ -327,9 +519,16 @@ Tabs.Settings:AddSlider("Distance", {
 })
 
 Tabs.Settings:AddButton({
-	Title = "Fechar menu e parar farm",
+	Title = "Escanear quests/monstros (console)",
+	Description = "Imprime no console o que o script encontra no jogo",
+	Callback = debugScan,
+})
+
+Tabs.Settings:AddButton({
+	Title = "Fechar menu e parar tudo",
 	Callback = function()
 		State.Farming = false
+		State.AutoStats = false
 		Fluent:Destroy()
 	end,
 })
@@ -337,13 +536,32 @@ Tabs.Settings:AddButton({
 Window:SelectTab(1)
 
 Fluent:Notify({
-	Title = "Auto Farm v2",
+	Title = "Auto Farm v3",
 	Content = "Carregado! RightShift minimiza o menu.",
 	Duration = 5,
 })
 
 ----------------------------------------------------------------
--- Loop principal
+-- Loop do auto-upar status
+----------------------------------------------------------------
+task.spawn(function()
+	local warned = false
+	while task.wait(1) do
+		if State.AutoStats then
+			local ok, err = upgradeSelected()
+			if not ok and not warned then
+				warned = true
+				Fluent:Notify({ Title = "Status", Content = err, Duration = 5 })
+			elseif ok then
+				warned = false
+			end
+			task.wait(math.max(State.StatInterval - 1, 0))
+		end
+	end
+end)
+
+----------------------------------------------------------------
+-- Loop principal do farm
 ----------------------------------------------------------------
 task.spawn(function()
 	while task.wait() do
@@ -363,7 +581,32 @@ task.spawn(function()
 			end
 
 			if State.Farming then
-				local q = pickQuest()
+				local q, nextLocked, unknown, level = pickQuest()
+
+				-- Avisos sobre quests bloqueadas / sem level conhecido
+				local info = ""
+				if nextLocked then
+					info = string.format(
+						"Próxima quest: %s (level %d). Você está no level %s, continuando o farm.",
+						nextLocked.quest.Name, nextLocked.req, tostring(level)
+					)
+				end
+				if #unknown > 0 then
+					local list = {}
+					for _, u in ipairs(unknown) do
+						table.insert(list, u.Name)
+					end
+					info = info .. (info ~= "" and "\n" or "")
+						.. "Não consegui descobrir o level de: " .. table.concat(list, ", ")
+						.. ". Defina MinLevel no script."
+				end
+				if State.AutoByLevel and not level then
+					info = "Level do jogador não encontrado, usando a quest manual."
+				end
+				if info ~= "" and info ~= State.LastInfo then
+					State.LastInfo = info
+					Fluent:Notify({ Title = "Quests", Content = info, Duration = 8 })
+				end
 
 				if q ~= currentQuest then
 					currentQuest = q
@@ -390,4 +633,4 @@ task.spawn(function()
 			end
 		end
 	end
-end)
+end)]
