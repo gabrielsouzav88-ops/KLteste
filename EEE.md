@@ -1,4 +1,4 @@
--- Auto Farm v3 (Fluent UI) A
+-- Auto Farm v3 (Fluent UI) AAAAAZA
 -- Novidades: aba de Status (upar stats), quest do Smoky, deteccao do level
 -- necessario de cada quest e aviso quando nao for possivel descobrir.
 -- Biblioteca: https://github.com/dawid-scripts/Fluent
