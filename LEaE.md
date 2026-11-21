@@ -15,7 +15,7 @@ local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/
 -- Configurações / estado
 ----------------------------------------------------------------
 local CONFIG = {
-	NpcName = "Soldier Town",
+	NpcName = "Soldier [Lv. 1]",
 	QuestArgs = {"take", "Kill 4 Soldiers"},
 	M1Args = {"FS_None_M1"},
 }
@@ -78,7 +78,10 @@ local function findNearestMob()
 	local root = getRoot()
 	local best, bestDist
 
-	for _, obj in ipairs(workspace:GetDescendants()) do
+	local monster = workspace:FindFirstChild("Monster")
+	local folder = (monster and monster:FindFirstChild("Mon")) or workspace
+
+	for _, obj in ipairs(folder:GetDescendants()) do
 		if isTarget(obj) and isAlive(obj) then
 			local dist = (getMobRoot(obj).Position - root.Position).Magnitude
 			if not bestDist or dist < bestDist then
