@@ -1,27 +1,72 @@
--- Auto Farm v3 (Fluent UI) AAAAAZA
--- Novidades: aba de Status (upar stats), quest do Smoky, deteccao do level
--- necessario de cada quest e aviso quando nao for possivel descobrir.
+-- Auto Farm v3.1 (Fluent UI)
+-- Base: v3. Foco desta versão: robustez (não travar, não duplicar loops,
+-- não varrer o mapa inteiro sem necessidade, limpar tudo ao fechar).
+-- Nenhum nome de remote, quest, argumento ou caminho do jogo foi alterado:
+-- tudo continua vindo da CONFIGURAÇÃO abaixo.
 -- Biblioteca: https://github.com/dawid-scripts/Fluent
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
-local Functions = ReplicatedStorage.Chest.Remotes.Functions
-local QuestRemote = Functions.Quest
-local SkillRemote = Functions.SkillAction
 
-local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+-- Executar de novo derruba a instância anterior (evita dois farms ao mesmo tempo)
+local env = (getgenv and getgenv()) or _G
+if env.KLAutoFarmStop then
+	pcall(env.KLAutoFarmStop)
+	env.KLAutoFarmStop = nil
+end
 
 ----------------------------------------------------------------
--- CONFIGURACAO
+-- Dependências (falha cedo, com mensagem clara)
+----------------------------------------------------------------
+local function waitChain(root, names, timeout)
+	local node = root
+	for _, name in ipairs(names) do
+		node = node:WaitForChild(name, timeout)
+		if not node then
+			return nil, name
+		end
+	end
+	return node
+end
+
+local Functions, missingName = waitChain(ReplicatedStorage, { "Chest", "Remotes", "Functions" }, 10)
+if not Functions then
+	warn("[AutoFarm] Não encontrei '" .. tostring(missingName)
+		.. "' em ReplicatedStorage.Chest.Remotes.Functions. O jogo mudou ou ainda não carregou.")
+	return
+end
+
+local QuestRemote = Functions:WaitForChild("Quest", 10)
+local SkillRemote = Functions:WaitForChild("SkillAction", 10)
+if not (QuestRemote and SkillRemote) then
+	warn("[AutoFarm] Remote 'Quest' ou 'SkillAction' não encontrado em Functions.")
+	return
+end
+if not (QuestRemote:IsA("RemoteFunction") and SkillRemote:IsA("RemoteFunction")) then
+	warn("[AutoFarm] 'Quest' e 'SkillAction' deveriam ser RemoteFunction (o script usa InvokeServer). Classes: "
+		.. QuestRemote.ClassName .. " / " .. SkillRemote.ClassName)
+	return
+end
+
+local okFluent, Fluent = pcall(function()
+	return loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+end)
+if not okFluent or not Fluent then
+	warn("[AutoFarm] Falha ao carregar a Fluent: " .. tostring(Fluent))
+	return
+end
+
+----------------------------------------------------------------
+-- CONFIGURAÇÃO
 ----------------------------------------------------------------
 local M1Args = {"FS_None_M1"}
 
--- Npc      = trecho do nome do monstro (ignora espacos e maiusculas)
--- MinLevel = level necessario. Se deixar vazio (nil), o script tenta
+-- Npc      = trecho do nome do monstro (ignora espaços e maiúsculas)
+-- MinLevel = level necessário. Se deixar vazio (nil), o script tenta
 --            descobrir pelo "[Lv. N]" no nome do monstro dentro do jogo.
---            Se nao conseguir, ele AVISA e nao troca para essa quest.
+--            Se não conseguir, ele AVISA e não troca para essa quest.
 local QUESTS = {
 	{ Name = "Kill 4 Soldiers",      MinLevel = 1,   Npc = "Soldier",      Args = {"take", "Kill 4 Soldiers"} },
 	{ Name = "Kill 5 Clown Pirates", MinLevel = nil, Npc = "Clown Pirate", Args = {"take", "Kill 5 Clown Pirates"} },
@@ -47,10 +92,18 @@ local LEVEL_PATH = function()
 	end
 end
 
+-- Ajustes de robustez (valores NÃO calibrados no jogo, mexa se precisar)
+local MOB_FOLDER_NAME = "Monster" -- pasta dos monstros em workspace (a mesma da v3)
+local MOB_TIMEOUT = 25            -- segundos máximos num mesmo mob antes de pular
+local MOB_SKIP_TIME = 15          -- quanto tempo um mob pulado fica ignorado
+local QUEST_TIMEOUT = 3           -- espera máxima pela resposta do remote de quest
+local M1_STALE_AFTER = 2          -- se o M1 não responder em N s, libera o próximo
+
 ----------------------------------------------------------------
 -- Estado
 ----------------------------------------------------------------
 local State = {
+	Alive = true, -- false = todos os loops encerram
 	Farming = false,
 	AutoQuest = true,
 	AutoByLevel = true,
@@ -74,6 +127,11 @@ local currentQuest = nil
 ----------------------------------------------------------------
 local function normalize(name)
 	return (name:gsub("%s", ""):lower())
+end
+
+-- Chave normalizada calculada uma vez por quest (antes era recalculada por objeto)
+for _, q in ipairs(QUESTS) do
+	q.NpcKey = normalize(q.Npc)
 end
 
 local function aliveChar()
@@ -100,8 +158,24 @@ local function isAlive(mob)
 	return hum and hum.Health > 0 and getMobRoot(mob)
 end
 
+local mobFolder
+local warnedMobFolder = false
+
 local function getMobFolder()
-	return workspace:FindFirstChild("Monster") or workspace
+	if mobFolder and mobFolder.Parent then
+		return mobFolder
+	end
+	local folder = workspace:FindFirstChild(MOB_FOLDER_NAME)
+	if folder then
+		mobFolder = folder
+		return folder
+	end
+	if not warnedMobFolder then
+		warnedMobFolder = true
+		warn("[AutoFarm] workspace." .. MOB_FOLDER_NAME
+			.. " não encontrada: varrendo o workspace inteiro (mais pesado).")
+	end
+	return workspace
 end
 
 ----------------------------------------------------------------
@@ -109,6 +183,7 @@ end
 ----------------------------------------------------------------
 local LEVEL_NAMES = { level = true, lv = true, lvl = true, levels = true }
 local cachedLevelObj
+local lastLevelScan = -math.huge
 
 local function getLevel()
 	if LEVEL_PATH then
@@ -122,6 +197,18 @@ local function getLevel()
 		return tonumber(cachedLevelObj.Value)
 	end
 
+	for name, value in pairs(player:GetAttributes()) do
+		if LEVEL_NAMES[name:lower()] and tonumber(value) then
+			return tonumber(value)
+		end
+	end
+
+	-- varredura de descendentes limitada a uma vez a cada 5 s
+	if os.clock() - lastLevelScan < 5 then
+		return nil
+	end
+	lastLevelScan = os.clock()
+
 	for _, d in ipairs(player:GetDescendants()) do
 		if (d:IsA("IntValue") or d:IsA("NumberValue"))
 			and LEVEL_NAMES[d.Name:lower()] then
@@ -130,35 +217,31 @@ local function getLevel()
 		end
 	end
 
-	for name, value in pairs(player:GetAttributes()) do
-		if LEVEL_NAMES[name:lower()] and tonumber(value) then
-			return tonumber(value)
-		end
-	end
-
 	return nil
 end
 
 ----------------------------------------------------------------
--- Monstros / level necessario das quests
+-- Monstros / level necessário das quests
 ----------------------------------------------------------------
-local function isTarget(obj, npcPart)
-	if not obj:IsA("Model") or Players:GetPlayerFromCharacter(obj) then
+local function isTarget(obj, key)
+	if not obj:IsA("Model") then
 		return false
 	end
-	local wanted = normalize(npcPart)
 	local hum = obj:FindFirstChildOfClass("Humanoid")
 	if not hum then
 		return false
 	end
-	return normalize(obj.Name):find(wanted, 1, true) ~= nil
-		or normalize(hum.DisplayName):find(wanted, 1, true) ~= nil
+	if normalize(obj.Name):find(key, 1, true) == nil
+		and normalize(hum.DisplayName):find(key, 1, true) == nil then
+		return false
+	end
+	return not Players:GetPlayerFromCharacter(obj)
 end
 
 local estimatedLevels = {}
 local lastScan = {}
 
--- Descobre o level pelo "[Lv. N]" do monstro. Retorna nil se nao achar.
+-- Descobre o level pelo "[Lv. N]" do monstro. Retorna nil se não achar.
 local function estimateLevel(q)
 	if estimatedLevels[q.Name] then
 		return estimatedLevels[q.Name]
@@ -170,7 +253,7 @@ local function estimateLevel(q)
 
 	local lowest
 	for _, obj in ipairs(getMobFolder():GetDescendants()) do
-		if isTarget(obj, q.Npc) then
+		if isTarget(obj, q.NpcKey) then
 			local hum = obj:FindFirstChildOfClass("Humanoid")
 			local text = obj.Name .. " " .. (hum and hum.DisplayName or "")
 			local n = tonumber(text:match("[Ll][Vv]%.?%s*(%d+)"))
@@ -202,7 +285,7 @@ local function findQuestByName(name)
 	return QUESTS[1]
 end
 
--- Retorna: quest escolhida, proxima quest bloqueada, lista de quests sem level conhecido
+-- Retorna: quest escolhida, próxima quest bloqueada, lista de quests sem level conhecido, level
 local function pickQuest()
 	if State.AutoByLevel then
 		local level = getLevel()
@@ -230,17 +313,43 @@ local function pickQuest()
 	return findQuestByName(State.ManualQuest), nil, {}, nil
 end
 
+-- Antes: InvokeServer direto no loop principal (se o servidor não respondesse,
+-- o farm inteiro congelava). Agora espera a resposta, mas com limite de tempo.
 local function takeQuest(q)
-	pcall(function()
-		QuestRemote:InvokeServer(table.unpack(q.Args))
+	local done = false
+	task.spawn(function()
+		pcall(QuestRemote.InvokeServer, QuestRemote, table.unpack(q.Args))
+		done = true
+	end)
+	local startedAt = os.clock()
+	while not done and State.Alive and os.clock() - startedAt < QUEST_TIMEOUT do
+		task.wait()
+	end
+end
+
+-- M1 sem bloquear o loop: no máximo uma chamada em andamento por vez
+local m1Token = 0
+local m1Pending = false
+local m1StartedAt = 0
+
+local function m1()
+	if m1Pending and os.clock() - m1StartedAt < M1_STALE_AFTER then
+		return
+	end
+	m1Token += 1
+	local token = m1Token
+	m1Pending = true
+	m1StartedAt = os.clock()
+	task.spawn(function()
+		pcall(SkillRemote.InvokeServer, SkillRemote, table.unpack(M1Args))
+		if token == m1Token then
+			m1Pending = false
+		end
 	end)
 end
 
-local function m1()
-	pcall(function()
-		SkillRemote:InvokeServer(table.unpack(M1Args))
-	end)
-end
+-- mobs que estouraram o tempo ficam ignorados por um período
+local skipped = setmetatable({}, { __mode = "k" })
 
 local function findNearestMob(q)
 	local root = getRoot()
@@ -248,9 +357,10 @@ local function findNearestMob(q)
 		return nil
 	end
 
+	local now = os.clock()
 	local best, bestDist
 	for _, obj in ipairs(getMobFolder():GetDescendants()) do
-		if isTarget(obj, q.Npc) and isAlive(obj) then
+		if isTarget(obj, q.NpcKey) and isAlive(obj) and (skipped[obj] or 0) < now then
 			local dist = (getMobRoot(obj).Position - root.Position).Magnitude
 			if not bestDist or dist < bestDist then
 				best, bestDist = obj, dist
@@ -261,14 +371,20 @@ local function findNearestMob(q)
 	return best
 end
 
--- Ataca ate o mob morrer, ou ate VOCE morrer / desligar o farm
+-- Ataca até o mob morrer, ou até VOCÊ morrer / desligar o farm / estourar o tempo
 local function killMob(mob)
 	local hum = mob:FindFirstChildOfClass("Humanoid")
+	local startedAt = os.clock()
 
-	while State.Farming and isAlive(mob) and hum.Health > 0 do
+	while State.Alive and State.Farming and isAlive(mob) do
 		local root = getRoot()
 		if not root then
-			return false -- voce morreu
+			return false -- você morreu
+		end
+
+		if os.clock() - startedAt > MOB_TIMEOUT then
+			skipped[mob] = os.clock() + MOB_SKIP_TIME
+			return false
 		end
 
 		root.CFrame = getMobRoot(mob).CFrame * CFrame.new(0, 0, State.Distance)
@@ -277,7 +393,7 @@ local function killMob(mob)
 		task.wait(State.AttackDelay)
 	end
 
-	if hum.Health <= 0 then
+	if hum and hum.Health <= 0 then
 		State.Kills += 1
 		return true
 	end
@@ -291,7 +407,10 @@ local function getStatsRemote()
 	local ok, remote = pcall(function()
 		return player.PlayerGui.MainGui.StarterFrame.StatsFrame.RemoteEvent
 	end)
-	return ok and remote or nil
+	if ok and remote and remote:IsA("RemoteEvent") then
+		return remote
+	end
+	return nil
 end
 
 local function upgradeStat(stat, amount)
@@ -311,7 +430,7 @@ local function upgradeSelected()
 		if State.Stats[stat] then
 			any = true
 			if not upgradeStat(stat, State.StatAmount) then
-				return false, "Remote dos status nao encontrado."
+				return false, "Remote dos status não encontrado (ou não é um RemoteEvent)."
 			end
 		end
 	end
@@ -322,7 +441,7 @@ local function upgradeSelected()
 end
 
 ----------------------------------------------------------------
--- Diagnostico: lista monstros e possiveis dados de quest no console
+-- Diagnóstico: lista monstros e possíveis dados de quest no console
 ----------------------------------------------------------------
 local function debugScan()
 	local lines = 0
@@ -333,7 +452,7 @@ local function debugScan()
 		lines += 1
 	end
 
-	out("---- MONSTROS (nomes unicos) ----")
+	out("---- MONSTROS (nomes únicos) ----")
 	local seen = {}
 	for _, obj in ipairs(getMobFolder():GetDescendants()) do
 		if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid")
@@ -343,13 +462,17 @@ local function debugScan()
 		end
 	end
 
-	out("---- POSSIVEIS DADOS DE QUEST ----")
+	out("---- POSSÍVEIS DADOS DE QUEST ----")
 	for _, root in ipairs({ ReplicatedStorage, workspace }) do
 		for _, obj in ipairs(root:GetDescendants()) do
 			if obj.Name:lower():find("quest") then
 				out(obj.ClassName, obj:GetFullName())
 			end
 		end
+	end
+
+	if lines > 250 then
+		print(("(... %d linhas omitidas)"):format(lines - 250))
 	end
 
 	Fluent:Notify({
@@ -360,11 +483,27 @@ local function debugScan()
 end
 
 ----------------------------------------------------------------
+-- Encerramento (único caminho de limpeza)
+----------------------------------------------------------------
+local function shutdown()
+	State.Alive = false
+	State.Farming = false
+	State.AutoStats = false
+	pcall(function()
+		Fluent:Destroy()
+	end)
+	if env.KLAutoFarmStop == shutdown then
+		env.KLAutoFarmStop = nil
+	end
+end
+env.KLAutoFarmStop = shutdown
+
+----------------------------------------------------------------
 -- Interface
 ----------------------------------------------------------------
 local Window = Fluent:CreateWindow({
 	Title = "Auto Farm",
-	SubTitle = "v3",
+	SubTitle = "v3.1",
 	TabWidth = 140,
 	Size = UDim2.fromOffset(540, 460),
 	Acrylic = false,
@@ -375,7 +514,7 @@ local Window = Fluent:CreateWindow({
 local Tabs = {
 	Farm = Window:AddTab({ Title = "Farm", Icon = "swords" }),
 	Stats = Window:AddTab({ Title = "Status", Icon = "bar-chart" }),
-	Settings = Window:AddTab({ Title = "Configuracoes", Icon = "settings" }),
+	Settings = Window:AddTab({ Title = "Configurações", Icon = "settings" }),
 }
 
 -- ===== Aba Farm =====
@@ -385,15 +524,20 @@ local StatusLabel = Tabs.Farm:AddParagraph({
 })
 
 local function updateStatus(text)
+	if not State.Alive then
+		return
+	end
 	local level = getLevel()
-	StatusLabel:SetDesc(string.format(
-		"%s\nLevel: %s | Kills: %d | Mortes: %d\nQuest: %s",
-		text,
-		level and tostring(level) or "nao encontrado",
-		State.Kills,
-		State.Deaths,
-		currentQuest and currentQuest.Name or "-"
-	))
+	pcall(function()
+		StatusLabel:SetDesc(string.format(
+			"%s\nLevel: %s | Kills: %d | Mortes: %d\nQuest: %s",
+			text,
+			level and tostring(level) or "não encontrado",
+			State.Kills,
+			State.Deaths,
+			currentQuest and currentQuest.Name or "-"
+		))
+	end)
 end
 
 Tabs.Farm:AddToggle("FarmToggle", {
@@ -402,7 +546,7 @@ Tabs.Farm:AddToggle("FarmToggle", {
 	Default = false,
 }):OnChanged(function(value)
 	State.Farming = value
-	currentQuest = nil -- forca pegar a quest ao ligar
+	currentQuest = nil -- força pegar a quest ao ligar
 	if not value then
 		updateStatus("Parado")
 	end
@@ -423,7 +567,7 @@ end
 
 Tabs.Farm:AddDropdown("ManualQuest", {
 	Title = "Quest manual",
-	Description = "Usada se o level automatico estiver desligado ou nao for achado",
+	Description = "Usada se o level automático estiver desligado ou não for achado",
 	Values = names,
 	Multi = false,
 	Default = 1,
@@ -441,7 +585,7 @@ end)
 -- ===== Aba Status (upar stats) =====
 Tabs.Stats:AddParagraph({
 	Title = "Distribuir pontos",
-	Content = "Marque os status que quer upar. Se tiver poucos pontos, marque so um.",
+	Content = "Marque os status que quer upar. Se tiver poucos pontos, marque só um.",
 })
 
 for _, stat in ipairs(STAT_NAMES) do
@@ -495,7 +639,7 @@ Tabs.Stats:AddSlider("StatInterval", {
 	end,
 })
 
--- ===== Aba Configuracoes =====
+-- ===== Aba Configurações =====
 Tabs.Settings:AddSlider("AttackDelay", {
 	Title = "Delay entre M1 (s)",
 	Default = 0.15,
@@ -508,7 +652,7 @@ Tabs.Settings:AddSlider("AttackDelay", {
 })
 
 Tabs.Settings:AddSlider("Distance", {
-	Title = "Distancia do inimigo",
+	Title = "Distância do inimigo",
 	Default = 3,
 	Min = 1,
 	Max = 10,
@@ -526,17 +670,13 @@ Tabs.Settings:AddButton({
 
 Tabs.Settings:AddButton({
 	Title = "Fechar menu e parar tudo",
-	Callback = function()
-		State.Farming = false
-		State.AutoStats = false
-		Fluent:Destroy()
-	end,
+	Callback = shutdown,
 })
 
 Window:SelectTab(1)
 
 Fluent:Notify({
-	Title = "Auto Farm v3",
+	Title = "Auto Farm v3.1",
 	Content = "Carregado! RightShift minimiza o menu.",
 	Duration = 5,
 })
@@ -546,8 +686,10 @@ Fluent:Notify({
 ----------------------------------------------------------------
 task.spawn(function()
 	local warned = false
-	while task.wait(1) do
-		if State.AutoStats then
+	local nextRun = 0
+	while State.Alive do
+		task.wait(0.5)
+		if State.AutoStats and os.clock() >= nextRun then
 			local ok, err = upgradeSelected()
 			if not ok and not warned then
 				warned = true
@@ -555,7 +697,7 @@ task.spawn(function()
 			elseif ok then
 				warned = false
 			end
-			task.wait(math.max(State.StatInterval - 1, 0))
+			nextRun = os.clock() + State.StatInterval
 		end
 	end
 end)
@@ -564,30 +706,33 @@ end)
 -- Loop principal do farm
 ----------------------------------------------------------------
 task.spawn(function()
-	while task.wait() do
+	while State.Alive do
+		task.wait()
 		if State.Farming then
-			-- Morreu? espera o respawn e recomeca
+			-- Morreu? espera o respawn e recomeça
 			if not aliveChar() then
-				State.Deaths += 1
+				if player.Character then
+					State.Deaths += 1 -- só conta se havia personagem (e não só carregando)
+				end
 				updateStatus("Morreu, aguardando respawn...")
 				repeat
 					task.wait(0.5)
-				until aliveChar() or not State.Farming
+				until aliveChar() or not State.Farming or not State.Alive
 
-				if State.Farming then
+				if State.Farming and State.Alive then
 					task.wait(2) -- deixa o personagem carregar
 					currentQuest = nil -- repega a quest
 				end
 			end
 
-			if State.Farming then
+			if State.Farming and State.Alive then
 				local q, nextLocked, unknown, level = pickQuest()
 
 				-- Avisos sobre quests bloqueadas / sem level conhecido
 				local info = ""
 				if nextLocked then
 					info = string.format(
-						"Proxima quest: %s (level %d). Voce esta no level %s, continuando o farm.",
+						"Próxima quest: %s (level %d). Você está no level %s, continuando o farm.",
 						nextLocked.quest.Name, nextLocked.req, tostring(level)
 					)
 				end
@@ -597,11 +742,11 @@ task.spawn(function()
 						table.insert(list, u.Name)
 					end
 					info = info .. (info ~= "" and "\n" or "")
-						.. "Nao consegui descobrir o level de: " .. table.concat(list, ", ")
+						.. "Não consegui descobrir o level de: " .. table.concat(list, ", ")
 						.. ". Defina MinLevel no script."
 				end
 				if State.AutoByLevel and not level then
-					info = "Level do jogador nao encontrado, usando a quest manual."
+					info = "Level do jogador não encontrado, usando a quest manual."
 				end
 				if info ~= "" and info ~= State.LastInfo then
 					State.LastInfo = info
